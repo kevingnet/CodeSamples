@@ -1,0 +1,725 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use IO::Socket;
+use IO::File;
+
+my %defaults = (
+"host"		=> "localhost",
+"port"		=> 7077,
+"frequency" 	=> 1000,
+"redratsn"     	=> "^", 
+"servermode"	=> 0,
+);
+
+#TODO: add exec command
+
+use constant { svr_manual => 0,  svr_automatic => 1,  svr_start => 2, };
+use constant { EVAL => 0,  TOKEN => 1,  LOOP => 2, };
+my %cmd_tokens = (
+	"selectallredrats"	=> EVAL,
+	"deselectallredrats"	=> EVAL,
+	"addnextredrat"		=> EVAL,
+	"keepalive"		=> EVAL,
+	"wait1"			=> EVAL,
+	"blink"			=> EVAL,
+	"channel"		=> TOKEN,
+	"keypad"		=> TOKEN,
+	"frequency"		=> TOKEN,
+	"addredrat"		=> TOKEN,
+	"delredrat"		=> TOKEN,
+	"setredrat"		=> TOKEN,
+	"delay"			=> TOKEN,
+	"sleep1"		=> TOKEN,
+	"dialog"		=> TOKEN,
+	"output"		=> TOKEN,
+	"timeout"		=> TOKEN,
+	"loop"			=> LOOP,
+);
+my %check_text = ( "delay"=>1, "sleep"=>1, "dialog"=>1, "output"=>1, "sleep"=>1, "print"=>1, );
+my %translate  = ( "sleep"=>"sleep1", "wait"=>"wait1", "print"=>"output", );
+
+my %server_errors  = ( 
+	0 => "ok",
+	2 => "device error!!!",
+	3 => "invalid device!!",
+	4 => "device unavailable!",
+	5 => "redrat not found",
+	6 => "redrat unavailable",
+	7 => "redrat in use",
+	8 => "redrat already in use",
+	9 => "redrat not in use",
+	10 => "redrat not owned",
+	11 => "no redrats available",
+);
+
+my ( %CONFIG, %MACROS, %COMMANDS, @search_path, @arr, $script, $tabs, $client, $time_start, $time_out, $time_end, $sigfile, $serverexe, $svr_status, $socketID, $clientID );
+
+startup();
+main_loop( 1, 0, scalar(@arr) - 1 );
+cleanup();
+
+sub main_loop
+{
+	my ( $times, $arr_start, $arr_end ) = @_;
+	if ( $times > 1 ){ print "$tabs ' looping $times times\n"; }
+	$tabs .= "\t";
+	for (my $i=1; $i<=$times; $i++){
+		for (my $j=$arr_start; $j<=$arr_end; $j++){
+			my $cmd = $cmd_tokens{$arr[$j]};
+			if ( not defined $cmd ){
+				&ssend($arr[$j]);
+			}elsif ( $cmd == EVAL ){
+				eval $arr[$j];
+			}elsif ( $cmd == TOKEN ){
+				eval "$arr[$j](\"$arr[++$j]\");";
+			}elsif ( $cmd == LOOP ){
+				$j = call_loop($arr[++$j], $j, $arr_end);
+			}
+			check_time_out();
+		}
+		if ( ($times > 1) && ( $arr_end - $arr_start ) > 0 ){ print "$tabs ' completed #$i\n"; }
+	}
+	chop $tabs;
+	if ( $times > 1 ){ print "$tabs ' end of loop ($times times)\n"; }
+}
+
+#==========================================================================
+#                            C O M M A N D S
+#==========================================================================
+
+sub keypad
+{
+	my %keypad_chars_x = ( 
+	A => 1,  B => 2,  C => 3,  D => 4,  E => 5,  F => 6, 
+	G => 1,  H => 2,  I => 3,  J => 4,  K => 5,  L => 6, 
+	M => 1,  N => 2,  O => 3,  P => 4,  Q => 5,  R => 6, 
+	S => 1,  T => 2,  U => 3,  V => 4,  W => 5,  X => 6, 
+	Y => 1,  Z => 2,  1 => 3,  2 => 4,  3 => 5,  4 => 6, 
+	5 => 1,  6 => 2,  7 => 3,  8 => 4,  9 => 5,  0 => 6, 
+	'~'=>1,  _ => 2);
+	my %keypad_chars_y = ( 
+	A => 1,  B => 1,  C => 1,  D => 1,  E => 1,  F => 1, 
+	G => 2,  H => 2,  I => 2,  J => 2,  K => 2,  L => 2, 
+	M => 3,  N => 3,  O => 3,  P => 3,  Q => 3,  R => 3, 
+	S => 4,  T => 4,  U => 4,  V => 4,  W => 4,  X => 4, 
+	Y => 5,  Z => 5,  1 => 5,  2 => 5,  3 => 5,  4 => 5, 
+	5 => 6,  6 => 6,  7 => 6,  8 => 6,  9 => 6,  0 => 6, 
+	'~'=>7,  _ => 7);
+
+	my $text 	= $_[0];
+	chomp 		($text);
+	print 		"\tkeypad $text\n";
+	$text 		=~ tr/[a-z]/[A-Z]/;
+	$text 		.= "0"; #goto zero at the end
+	my @chars 	= split (//,$text);
+	my $prev_x 	= 1;
+	my $prev_y 	= 1;
+	my $x_command 	= "";
+	my $y_command 	= "";
+
+	if ( $chars[0] eq '~' ){
+		&ssend("down"); &ssend("down"); &ssend("down"); &ssend("down"); &ssend("down"); &ssend("down");
+		&ssend("select"); &ssend("up");
+		$prev_y	= 6;
+		shift @chars;
+	}
+	$tabs 		.= "\t";
+	my $chars_len 	= scalar(@chars);
+	my @cmd_arr;
+	for (my $c=0; $c<$chars_len; $c++){
+		my $i;
+		my $cur_x = $keypad_chars_x{$chars[$c]};
+		my $cur_y = $keypad_chars_y{$chars[$c]};
+		print "\t   char: '$chars[$c]'\n";
+		if ( $chars[$c] eq '_' ){
+			if ( $prev_x == 1 || $prev_x == 2 ){
+				$prev_x = 1;
+			}elsif ( $prev_x == 3 || $prev_x == 4 ){
+				$prev_x = 2;
+			}else{
+				$prev_x = 3;
+			}
+		}
+		my $y_motion = $cur_y - $prev_y;
+		if ( $y_motion != 0 ){
+			$y_command = ($y_motion < 0) ? "up" : "down";
+			$y_motion = abs($y_motion);
+			for ($i=0; $i<$y_motion; $i++){
+				push(@cmd_arr,$y_command);
+			}
+		}
+		my $x_motion = $cur_x - $prev_x;
+		if ( $x_motion != 0 ){
+			$x_command = ($x_motion < 0) ? "left" : "right";
+			$x_motion = abs($x_motion);
+			for ($i=0; $i<$x_motion; $i++){
+				push(@cmd_arr,$x_command);
+			}
+		}
+		if ( $x_motion != 0 && $y_motion != 0 ){
+			for ($i = @cmd_arr; --$i; ) {
+				my $j = int rand ($i+1);
+				next if $i == $j;
+				@cmd_arr[$i,$j] = @cmd_arr[$j,$i];
+			}
+		}
+		foreach ( @cmd_arr ){
+			&ssend($_);
+		}
+		delete @cmd_arr[0 .. $#cmd_arr];
+		if ( ($c + 1) < $chars_len ){
+			&ssend("select");
+		}
+		if ( $chars[$c] eq '_' ){
+			$cur_x = 3;
+			$cur_y = 6;
+			&ssend("up");
+		}
+		$prev_x = $cur_x;
+		$prev_y = $cur_y;
+	}
+	chop $tabs;
+}
+
+sub channel
+{
+	print "$tabs channel $_[0]\n";
+	my @chars = split(//, $_[0]);
+	foreach my $char (@chars){
+		&ssend_char($char);
+	}
+	print "$tabs\tenter\n";
+	&send_command("enter");
+	&wait_freq;
+}
+
+sub frequency
+{ 
+	$CONFIG{frequency} = $_[0];
+	print "$tabs % setting frequency to $CONFIG{frequency}\n";
+}
+
+sub blink
+{
+	print "$tabs ! blink redrat\n";
+	&send_command("blink");
+}
+
+sub addnextredrat
+{
+	print "$tabs ^ selecting first available redrat\n";
+	&send_command("addnextredrat");
+}
+
+sub selectallredrats
+{
+	print "$tabs * selecting all redrats\n";
+	&send_command("selectallredrats");
+}
+
+sub deselectallredrats
+{
+	print "$tabs ~ deselecting all redrats\n";
+	&send_command("deselectallredrats");
+}
+
+sub addredrat
+{
+	print "$tabs + adding redrat sn# $_[0]\n";
+	&send_command("addredrat", $_[0]);
+}
+
+sub delredrat
+{
+	print "$tabs - deleting redrat sn# $_[0]\n";
+	&send_command("delredrat", $_[0]);
+}
+
+sub setredrat
+{
+	print "$tabs # setting redrat to sn# $_[0]\n";
+	&send_command("setredrat", $_[0]);
+	#select (undef, undef, undef, .5);
+}
+
+sub output
+{
+	print "$tabs \" $_[0]\n";
+}
+
+sub delay
+{  
+	print "$tabs * sleeping $_[0] milliseconds\n";
+	sleep ($_[0] / 1000);
+}
+
+sub sleep1
+{  
+	print "$tabs * sleeping $_[0] seconds\n";
+	sleep $_[0];
+}
+
+sub wait1
+{
+	system "dialog --keep-window --backtitle 'DIRECTV: redrat application' --title 'Waiting for user input' --msgbox 'Press the ENTER key to continue...' 20 56";
+}
+
+sub dialog
+{
+	system "dialog --keep-window --backtitle 'DIRECTV: redrat application' --title 'Waiting for user input' --msgbox '$_[0]' 20 56";
+}
+
+sub timeout
+{
+	$time_out = $_[0];
+	print "^ Script will timeout in about $time_out minutes\n";
+	$time_out *= 60;
+}
+
+sub keepalive
+{
+	&send_command("keepalive");
+}
+
+#==========================================================================
+
+sub check_time_out()
+{
+	if ( $time_out > 0 ) {
+		my $time_cur = time();
+		if ( ( $time_cur - $time_start ) > $time_out ) {
+			$time_out /= 60;
+			print "^ Script time expired. timeout = $time_out minutes. Exiting...\n";
+			cleanup();
+			exit 0;
+		}
+	}
+}
+
+sub wait_freq
+{ 
+	select (undef, undef, undef, $CONFIG{frequency} / 1000);
+}
+
+sub ssend{ 
+	print "$tabs CMD '$_[0]'\n";
+	&send_command($_[0]);
+	&wait_freq;
+}
+
+sub ssend_char
+{ 
+	print "$tabs\t$_[0]\n";
+	&send_command($_[0]);
+	&wait_freq;
+}
+
+sub send_command
+{
+	my $var = lc $_[0];
+	my $parm1 = $_[1];
+	my $cmd = $COMMANDS{$var};
+	if ( defined $cmd ){
+		my $tok = pack("n", $cmd);
+		if( defined $parm1 ){
+			$tok .= pack("N", $parm1); #4 bytes, for redrat serial number, or anything really...
+		}
+		$client->send($tok);
+		&process_server_response();
+	} else {
+		print "Error!: Invalid command: $var \n";
+	}
+}
+
+sub process_server_response
+{
+	my $res;
+	sysread( $client, $res, 2 );
+	my $tok = unpack("v", $res);
+	if( defined $tok && $tok != 0 ){
+		my $err_msg = $server_errors{$tok};
+		if( defined $err_msg ) {
+			print "Server Error!: $err_msg\n";
+		} else {
+			print "Server Error!: Unknown server response!!! \n";
+		}
+	}
+}
+
+sub server_connect
+{
+	$client = IO::Socket::INET->new(	PeerAddr   => $CONFIG{host},
+                  	                 	PeerPort   => $CONFIG{port},
+                        	           	Proto      => 'tcp' )
+             or die "$0: ERROR: could not connect to server: $!\n";
+	my $res;
+	sysread( $client, $res, 6 );
+	$socketID = unpack("v", $res);
+	$clientID = unpack("xxV", $res);
+	if( defined $socketID ){
+		print "Server response: socket: $socketID";
+	}
+	if( defined $clientID ){
+		print " - id: $clientID";
+	}
+	print "\n\n\n";
+}
+
+#==========================================================================
+#                    H E L P E R   F U N C T I O N S
+#==========================================================================
+
+sub call_loop($$$)
+{
+	my ( $tok, $pos ) = @_;
+	my $end = &get_end_of_loop($pos, $_[2]);
+	&main_loop( $tok, $pos + 1, $end);
+	return $end + 1;
+}
+
+sub get_end_of_loop
+{ 
+	my ( $start, $end ) = @_;
+	my @stack;
+	push( @stack, 0 );
+	my $pos 	= 0;
+	for (my $i=$start; $i<=$end; $i++){
+		if( $arr[$i] =~ /loop/i ){
+			push( @stack, $i );
+		}elsif( $arr[$i] =~ /endl/i ){
+			$pos = pop( @stack );
+			if( $pos == 0 ){
+				$i--;
+				return $i;
+			}
+		}
+	}
+	if( $pos == 0 ){
+		print "Error: end of loop not found!";
+	}
+	return $pos - 1;
+}
+
+#==========================================================================
+#                    S C R I P T    F U N C T I O N S
+#==========================================================================
+
+sub process_line
+{
+	my $line = shift;
+	$line 	=~ s/[\#|\;].*//g			;	#discard any comments
+	$line 	=~ s/^[\s]+//				; 	#strip leading space
+	$line 	=~ s/[\s]+$//				; 	#strip trailing space
+	$line 	=~ s/[\s]+/ /g				;	#convert multiple spaces and/or tabs into one space
+	if ( $line ne "" ){
+		#if line is only loop, rename to endl to make it compatible with the windows version
+		$line 	=~ s/^loop$/endl/g		;
+		$line	=~ s/(.+)\@(\d+)(\S*)/$1$ARGV[$2]$3/ 	; 	#replace @digit for cmdline args, neat uh!?
+		#$line	=~ s/^\@(\d+)(\S*)/$ARGV[$1]$2/ 	; 	#replace @digit for cmdline args, neat uh!?
+		#$line	=~ s/^\@(\d+)/$ARGV[$1]/ 		; 	#replace @digit for cmdline args, neat uh!?
+		if ( $line =~ /\@(\w+)/ ) {
+			my $tok = $1;
+			my $macro = $MACROS{$tok};
+			if ( defined $macro ){
+				$line =~ s/\@$tok/$macro/g	;	#replace @text for macro
+			}else{
+				$line =~ s/\@$tok/output macro_error\:$tok/g;
+			}
+		}
+		$line =~ /^(\w+)\s(.+)/;
+		my $tok = $1;
+		my $txt = $2;
+		if ( defined $tok ){
+			$tok =~ tr/[A-Z]/[a-z]/;
+			if ( defined $check_text{$tok} ){
+				if ( defined $txt ){
+					$txt =~ s/ /\@/g;
+				}else{
+					$txt = "ERROR";
+				}
+				$line = $tok." ".$txt;
+			}
+		}
+		$script .= $line." ";
+	}
+}
+
+sub process_array
+{
+	chomp ($script);
+	@arr = split (/\s/, $script);
+	for (my $a=0; $a<scalar(@arr); $a++){
+		if ( $arr[$a] =~ /\@+/ ) {
+			$arr[$a] =~ s/\@/ /g;
+		}else{
+			my $tok = $arr[$a];
+			$tok =~ tr/[A-Z]/[a-z]/;
+			if ( defined $cmd_tokens{$tok} ){
+				$arr[$a] =~ tr/[A-Z]/[a-z]/;
+			}
+			$tok = $translate{$tok};
+			if ( defined $tok ){
+				$arr[$a] = $tok;
+			}
+		}
+	}
+}
+
+sub process_script
+{
+	unless ( defined $ARGV[0] ){
+		while(<STDIN>){
+			&process_or_include($_);
+		}
+	}else{
+		my $input_file;
+		if ( -e $ARGV[0] ){
+			$input_file 	= shift @ARGV;
+			my $F 		= IO::File->new($input_file) 
+					or die "Cannot open $input_file: $!";
+			while (<$F>){
+				&process_or_include($_);
+			}
+		}else{
+			while(<STDIN>){
+				&process_or_include($_);
+			}
+		}
+
+	}
+	process_array();
+}
+
+sub process_or_include
+{
+	local $_ = shift;
+	if (/^\@include (\S+)/) { &include($1);	}else{ &process_line($_); }
+}
+
+sub include
+{
+	my $name 	= shift;
+	$name		=~ s/^\@(\S+)/$ARGV[$1]/; #replace @digit for cmdline args, neat uh!?
+	print 		"@ Including script '$name'\n";
+	my $F 		= IO::File->new($name) 
+			or die "Cannot open $name: $!";
+	while (<$F>) { &process_or_include($_);	}
+}
+
+#==========================================================================
+#                    S E R V E R    F U N C T I O N S
+#==========================================================================
+
+sub check_server
+{
+	if ( $CONFIG{host} eq "localhost" || $CONFIG{host} eq "127.0.0.1" ){
+		my $cmd_check 		= "ps aux | grep $serverexe |grep -v grep";
+		my $result 		= `$cmd_check`;
+		if ( $result !~ /$serverexe/i ){
+			$svr_status = 0;
+			if ( $CONFIG{servermode} == svr_manual ){
+				print "$serverexe server not running! please start server manually...\n";
+				return;
+			}
+
+			print 		"$serverexe server not running! Starting $serverexe...\n";
+			my $cmd_start 	= "$serverexe";
+			$result 	= `$cmd_start`;
+			sleep(1);
+			$result 	= `$cmd_check`;
+			if ( $result !~ /$serverexe/i ){
+				print 	"Warning! Attempting to start $serverexe as root! Please fix usbfs permissions...\n";
+				print "Add to /etc/fstab the following line:\n";
+				print "none /proc/bus/usb usbfs devmode=0666,busmode=0777,listmode=0666 0 0\n";
+				print "Then type in the following commands as root: umount /proc/bus/usb ; mount -a\n";
+
+				$cmd_start 	= "sudo $serverexe";
+				$result 	= `$cmd_start`;
+				sleep(1);
+				$result 	= `$cmd_check`;
+				if ( $result !~ /$serverexe/i ){
+					print 	"Error!!! Unable to start $serverexe...\n";
+					exit 21;
+				}
+			}
+		}else{
+			$svr_status = 1;
+		}
+	}
+}
+
+sub startup
+{
+	$tabs = "";
+	$svr_status = 0;
+	$time_start = time();
+	load_configs();
+	check_server();
+	read_commands();
+	server_connect();
+	process_script();
+	#if first command is NOT redrat something use ALL redrat devices, by default
+	if ( $arr[0] !~ /redrat/i ){
+		if ( defined $CONFIG{redratsn}){
+			if ( $CONFIG{redratsn} eq "*" ){
+				print "Warning: Sending commands to all redrats. Specify redrat by serial number to prevent warning. eg. AddRedrat ?SerialNumber?\n";
+				&selectallredrats;
+			}elsif ( $CONFIG{redratsn} eq "^" ){
+				print "Info: Sending commands first available redrat\n";
+				&addnextredrat;
+			}else{
+				print "Info: Sending commands to redrat $CONFIG{redratsn}\n";
+				&setredrat($CONFIG{redratsn});
+			}
+		}else{
+			print "Warning: Sending commands to all redrats. Specify redrat by serial number to prevent warning. eg. AddRedrat ?SerialNumber?\n";
+			&selectallredrats;
+		}
+		select (undef, undef, undef, .5);
+	}
+	$time_out = 0;
+}
+
+sub cleanup
+{
+	close $client;
+	if ( $CONFIG{host} eq "localhost" || $CONFIG{host} eq "127.0.0.1" ){
+		if ( $CONFIG{servermode} == svr_automatic && $svr_status == 0 ){
+			print "Shutting down $serverexe...\n";
+			my $cmd = "pkill $serverexe";
+			my $result = `$cmd`;
+
+			my $cmd_check 		= "ps aux | grep $serverexe |grep -v grep";
+			$result 		= `$cmd_check`;
+			if ( $result =~ /$serverexe/i ){
+				$cmd = "sudo pkill $serverexe";
+				$result = `$cmd`;
+			}
+		}
+	}
+	$time_end = time();
+	my $difference = $time_end - $time_start;
+	my $seconds =  $difference % 60;
+	$difference = ($difference - $seconds) / 60;
+	my $minutes =  $difference % 60;
+	$difference = ($difference - $minutes) / 60;
+	my $hours   =  $difference % 24;
+	$difference = ($difference - $hours)   / 24;
+	my $days    =  $difference % 7;
+	my $weeks   = ($difference - $days)    /  7;
+	print "\n\nScript run time: $weeks weeks, $days days, $hours:$minutes:$seconds\n";
+}
+
+#==========================================================================
+#                    C O N F I G    F U N C T I O N S
+#==========================================================================
+
+sub calc_default
+{
+	my ( $name, $default ) = @_;
+	my $type = "cfg";
+	if ( defined $ENV{$name} ){
+		$CONFIG{$name} = $ENV{$name};
+		$type = "env";
+	}elsif( not defined $CONFIG{$name} ){
+		$CONFIG{$name} = $default;
+		$type = "default";
+	}
+	print "$type: $name = $CONFIG{$name}\n";
+}
+
+sub read_commands
+{
+	my $file = $sigfile;
+	my $f;
+	foreach my $p (@search_path) {
+		$f = $p.$file;
+		if ( -e $f ){
+			print STDOUT "Info: sig file '$f' \n";
+			last;
+		}
+	}
+
+	my $F 		= IO::File->new($f) 
+			or die "Cannot open $f: $!";
+	my $cmd_count = <$F>;
+	chomp( $cmd_count );
+	print "Redrat command count: $cmd_count\n";
+
+	for (my $a=0; $a<$cmd_count; $a++){
+		my $cmd = lc <$F>;
+		chomp($cmd);
+		$COMMANDS{$cmd} = $a;
+	}
+
+	$COMMANDS{"setredrat"} 		= 0x8001;
+	$COMMANDS{"addnextredrat"} 	= 0x8002;
+	$COMMANDS{"addredrat"} 		= 0x8003;
+	$COMMANDS{"delredrat"} 		= 0x8004;
+	$COMMANDS{"selectallredrats"} 	= 0x8005;
+	$COMMANDS{"deselectallredrats"} = 0x8006;
+	$COMMANDS{"keepalive"} 		= 0x8007;
+	$COMMANDS{"blink"} 		= 0x8008;
+	#while( my ($k, $v) = each %COMMANDS) { print "rrcmd: $v \t= $k\n"; }
+}
+
+sub open_hash($@%)
+{
+no strict;
+	($file, *path, *hash) = @_;
+	foreach my $p (@path) {
+		my $f = $p.$file;
+		if ( -e $f ){
+			print STDOUT "found file: '$f' \n";
+			if ( open(FILE,"<$f") ){
+				my @STRFILE=<FILE>;
+				close(FILE);
+				foreach my $line (@STRFILE) {
+					$line 	=~ s/[\#|\;].*//g			;	#discard any comments
+					$line 	=~ s/^[\s]+//				; 	#strip leading space
+					$line 	=~ s/[\s]+$//				; 	#strip trailing space
+					$line 	=~ s/[\s]+/ /g				;	#convert multiple spaces and/or tabs into one space
+					if ($line eq "") { next; }
+					$line =~ /(.*)\=(.*)/ ;
+					if ( defined $2 and $2 ne "" ){ $hash{lc($1)}=lc($2); }
+				}
+			}else{ 
+				print STDERR "Error: could not open file '$f' ($!)\n";
+			}
+		}
+	}
+}
+
+sub load_configs 
+{
+	eval 'exec $PERLLOCATION/bin/perl -x $0 ${1+"$@"} ;'
+	if 0;
+	$| = 1;
+	use File::Basename;
+	my $script_name = &File::Basename::basename($0);
+	push(@search_path,"/etc/");
+	my $home_dir = $ENV{HOME};
+	if( defined $home_dir ){ push(@search_path,$home_dir."/bin/"); push(@search_path, $home_dir."/."); }
+	my $dirname = &File::Basename::dirname($0);
+	push(@search_path,&File::Basename::dirname($0)."/");
+	if( $dirname ne "." ){
+		push(@search_path,"./");
+	}
+	my $config_name = $script_name;
+	chop($config_name);
+	$serverexe = $config_name."s";
+	$sigfile = $config_name.".sig";
+	$config_name .= ".cfg";
+	print "\nReading configuration files...\n";
+	open_hash( "$config_name", \@search_path, \%CONFIG );
+	print "\nReading macro files...\n";
+	open_hash( "$script_name.macros", \@search_path, \%MACROS );
+	print "\nApplication settings...\n";
+	while( my ($k, $v) = each %defaults) { calc_default($k,$v); }
+	print "\nAvailable macros...\n";
+	while( my ($k, $v) = each %MACROS) { print "macro: \@$k = '$v'\n"; }
+	print "\n";
+}
+
+

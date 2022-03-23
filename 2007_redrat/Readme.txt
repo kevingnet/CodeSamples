@@ -1,0 +1,1 @@
+red rat code for infrared transceiver, usb, perl client that reads scripts and sends commands to server that uses sockets, 
